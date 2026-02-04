@@ -78,10 +78,14 @@ def get_primvs_coverage(output_dir: Path) -> dict:
         # SMART SAMPLING:
         # If list is huge, check a random sample to save filesystem I/O
         check_ids = ids
-        result["method"] = "exact"
-            
-        result["checked_count"] = len(check_ids)
-        
+
+        if len(ids) > 5000:
+            check_ids = random.sample(ids, 5000)
+            result["method"] = "sampled (2k)"
+        else:
+            check_ids = ids
+            result["method"] = "exact"
+       
         # Check existence
         hits = 0
         for source_id in check_ids:
