@@ -8,7 +8,7 @@
 #SBATCH --mem=2G            # Kept high memory for safety (Node has 256GB )
 #SBATCH --time=7-00:00:00     # Updated to match the 7-day walltime of the main job 
 #SBATCH --partition=core96    # Added to target the correct queue 
-#SBATCH --array=1-3           # <-- CHANGE THIS: shards 1,2,3 (keep 0 for your running job)
+#SBATCH --array=0-9           # <-- CHANGE THIS: shards 1,2,3 (keep 0 for your running job)
 
 # ==============================================================================
 # VIRAC Sharded Extraction (Core96 Version)
