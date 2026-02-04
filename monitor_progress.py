@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-VIRAC Extraction Progress Monitor (Quality Control Edition)
-===========================================================
-Displays real-time progress and performs deep integrity checks on random files.
-Safe to run on directories with millions of files.
+VIRAC Extraction Progress Monitor (With Target List Support)
+============================================================
+Includes specific coverage check for PRIMVS_ID.csv targets.
+Auto-switches to statistical sampling if target list is huge.
 """
 
 import os
@@ -11,15 +11,16 @@ import sys
 import json
 import argparse
 import subprocess
+import random
+import csv
 from pathlib import Path
 from datetime import datetime
 import time
 
 DEFAULT_OUTPUT_DIR = "/beegfs/car/njm/virac_lightcurves/"
-
+PRIMVS_FILENAME = "PRIMVS_ID.csv"
 
 def load_json_safe(filepath: Path) -> dict:
-    """Load JSON file safely."""
     if not filepath.exists():
         return {}
     try:
@@ -28,9 +29,79 @@ def load_json_safe(filepath: Path) -> dict:
     except:
         return {}
 
+def get_primvs_coverage(output_dir: Path) -> dict:
+    """
+    Calculate coverage of IDs in PRIMVS_ID.csv.
+    Uses sampling if list is large to preserve performance.
+    """
+    # Look for CSV in the same directory as this script
+    script_dir = Path(__file__).parent.resolve()
+    primvs_path = script_dir / PRIMVS_FILENAME
+    
+    result = {
+        "found": False,
+        "total_targets": 0,
+        "checked_count": 0,
+        "hits": 0,
+        "percentage": 0.0,
+        "method": "exact"
+    }
+
+    if not primvs_path.exists():
+        return result
+
+    result["found"] = True
+    ids = []
+
+    try:
+        with open(primvs_path, 'r') as f:
+            reader = csv.DictReader(f)
+            # Handle potential whitespace in headers
+            headers = [h.strip() for h in reader.fieldnames]
+            
+            # Identify the ID column (case insensitive)
+            id_col = next((h for h in headers if "sourceid" in h.lower()), None)
+            
+            if not id_col:
+                # Fallback: try first column if no header match
+                f.seek(0)
+                next(f) # Skip header
+                ids = [line.split(',')[0].strip() for line in f if line.strip()]
+            else:
+                # Re-read with correct column
+                f.seek(0)
+                reader = csv.DictReader(f)
+                ids = [row[id_col].strip() for row in reader if row[id_col]]
+                
+        result["total_targets"] = len(ids)
+        
+        # SMART SAMPLING:
+        # If list is huge, check a random sample to save filesystem I/O
+        if len(ids) > 5000:
+            check_ids = random.sample(ids, 2000)
+            result["method"] = "sampled (2k)"
+        else:
+            check_ids = ids
+            result["method"] = "exact"
+            
+        result["checked_count"] = len(check_ids)
+        
+        # Check existence
+        hits = 0
+        for source_id in check_ids:
+            if (output_dir / f"{source_id}.csv").exists():
+                hits += 1
+        
+        result["hits"] = hits
+        if result["checked_count"] > 0:
+            result["percentage"] = (hits / result["checked_count"]) * 100
+            
+    except Exception as e:
+        print(f"Error reading {PRIMVS_FILENAME}: {e}")
+        
+    return result
 
 def get_directory_size_fast(path: Path, timeout: int = 2) -> str:
-    """Get directory size using 'du' with timeout."""
     try:
         result = subprocess.run(
             ['du', '-sh', str(path)], 
@@ -46,12 +117,7 @@ def get_directory_size_fast(path: Path, timeout: int = 2) -> str:
         pass
     return "N/A"
 
-
 def get_sample_files(directory: Path, n: int = 5) -> list:
-    """
-    Efficiently grab 'n' arbitrary CSV files using scandir.
-    Does NOT attempt to list the full directory.
-    """
     samples = []
     try:
         with os.scandir(directory) as entries:
@@ -64,43 +130,29 @@ def get_sample_files(directory: Path, n: int = 5) -> list:
         return []
     return samples
 
-
 def inspect_file_health(filepath: Path) -> dict:
-    """Read file head and verify integrity."""
-    result = {
-        "valid": False,
-        "head": [],
-        "error": None,
-        "size": 0
-    }
+    result = {"valid": False, "head": [], "error": None, "size": 0}
     try:
         result["size"] = filepath.stat().st_size
         if result["size"] == 0:
-            result["error"] = "File is empty (0 bytes)"
+            result["error"] = "Empty file (0B)"
             return result
         
         with open(filepath, 'r') as f:
-            # Read first 4 lines
             lines = [f.readline() for _ in range(4)]
             result["head"] = [L.strip() for L in lines if L]
             
-        # Check Header
-        expected_start = "mjd,ks_mag,ks_err"
-        if not result["head"] or not result["head"][0].startswith(expected_start):
-            result["error"] = "Invalid CSV Header"
+        if not result["head"] or "mjd" not in result["head"][0].lower():
+            result["error"] = "Invalid Header"
         elif len(result["head"]) < 2:
-            result["error"] = "File contains header only (no data)"
+            result["error"] = "No Data Rows"
         else:
             result["valid"] = True
-            
     except Exception as e:
         result["error"] = str(e)
-        
     return result
 
-
 def display_progress(output_dir: str, clear: bool = True):
-    """Display progress and quality checks."""
     output_dir = Path(output_dir)
     checkpoint_dir = output_dir / "checkpoints"
     
@@ -110,100 +162,72 @@ def display_progress(output_dir: str, clear: bool = True):
     print("=" * 70)
     print("VIRAC Light Curve Extraction Progress")
     print("=" * 70)
-    print(f"Output directory: {output_dir}")
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Output: {output_dir}")
+    print(f"Time:   {datetime.now().strftime('%H:%M:%S')}")
     print("-" * 70)
     
-    # --- Load Stats ---
+    # Stats
     completed_data = load_json_safe(checkpoint_dir / "completed_tiles.json")
     failed_data = load_json_safe(checkpoint_dir / "failed_tiles.json")
     progress_data = load_json_safe(checkpoint_dir / "progress.json")
     
     stats = completed_data.get("stats", {})
-    completed_list = completed_data.get("completed", [])
-    
-    n_completed = len(completed_list)
+    n_completed = len(completed_data.get("completed", []))
     n_failed = len(failed_data.get("failed", {}))
     
     real_csv_count = sum(item.get("n_valid", 0) for item in stats.values())
     real_source_count = sum(item.get("n_sources", 0) for item in stats.values())
-    
     total_tiles = progress_data.get("total_tiles", 22585)
+    
     percent = (n_completed / total_tiles * 100) if total_tiles > 0 else 0.0
 
-    print(f"Tiles Completed:   {n_completed:,} / {total_tiles:,} ({percent:.1f}%)")
-    print(f"Tiles Failed:      {n_failed:,}")
-    print(f"Sources Scanned:   {real_source_count:,}")
-    print(f"Valid Sources:     {real_csv_count:,} (Files Written)")
+    print(f"Tiles:   {n_completed:,} / {total_tiles:,} ({percent:.1f}%)")
+    print(f"Sources: {real_source_count:,} scanned -> {real_csv_count:,} saved")
     
-    # --- Quality Control Section ---
+    # --- PRIMVS COVERAGE CHECK ---
     print("-" * 70)
-    print("QUALITY CONTROL & SANITY CHECKS")
-    print("-" * 70)
-    
-    samples = get_sample_files(output_dir, n=5)
-    
-    if not samples:
-        print("Waiting for files to be created...")
+    primvs = get_primvs_coverage(output_dir)
+    if primvs["found"]:
+        p_str = f"{primvs['percentage']:.2f}%"
+        print(f"TARGET LIST ({PRIMVS_FILENAME})")
+        print(f"Coverage: {p_str} ({primvs['hits']}/{primvs['checked_count']} found)")
+        print(f"Total IDs: {primvs['total_targets']:,} | Method: {primvs['method']}")
     else:
-        print(f"Sample filenames on disk: {[f.name for f in samples]}")
-        print("-" * 70)
-        
-        # Inspect 3 files for deep check
-        files_to_inspect = samples[:3]
-        all_passed = True
-        
-        for fpath in files_to_inspect:
-            health = inspect_file_health(fpath)
-            status = "PASS" if health["valid"] else f"FAIL [{health['error']}]"
-            if not health["valid"]: all_passed = False
-            
-            print(f"File: {fpath.name}")
-            print(f"Size: {health['size']} bytes | Integrity: {status}")
-            print("Preview:")
-            for i, line in enumerate(health["head"]):
-                print(f"  {i+1}: {line}")
-            print("")
-            
-        print("-" * 70)
-        if all_passed:
-            print("System Health: OK (Files appear valid and populated)")
-        else:
-            print("System Health: WARNING (Detected malformed or empty files)")
+        print(f"Target list '{PRIMVS_FILENAME}' not found (skipping coverage check)")
+
+    # --- QC ---
+    print("-" * 70)
+    samples = get_sample_files(output_dir, n=3)
+    if samples:
+        print(f"QC Sample ({samples[0].name}):")
+        health = inspect_file_health(samples[0])
+        status = "OK" if health["valid"] else f"FAIL: {health['error']}"
+        print(f"  Integrity: {status} | Size: {health['size']} bytes")
+        if health["head"]:
+            print(f"  Header: {health['head'][0][:60]}...")
+            print(f"  Row 1:  {health['head'][1][:60]}...")
+    else:
+        print("Waiting for files...")
 
     print("=" * 70)
-    
-    if n_failed > 0:
-        print("\nRecent Tile Failures:")
-        recent_fails = list(failed_data.get("failed", {}).items())[-5:]
-        for tile_id, info in recent_fails:
-            print(f"  {tile_id}: {info.get('error', 'Unknown')[:80]}...")
-
 
 def watch_progress(output_dir: str, interval: int = 10):
-    """Continuously watch progress."""
-    print(f"Watching progress (refresh every {interval}s). Press Ctrl+C to stop.")
+    print(f"Watching... (Ctrl+C to stop)")
     try:
         while True:
             display_progress(output_dir, clear=True)
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("\nStopped watching.")
+        print("\nDone.")
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Monitor VIRAC Extraction (QC Mode)")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", "-o", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--watch", "-w", action="store_true")
     parser.add_argument("--interval", "-i", type=int, default=30)
-    
     args = parser.parse_args()
     
     if args.watch:
         watch_progress(args.output_dir, args.interval)
     else:
         display_progress(args.output_dir, clear=False)
-
-
-if __name__ == "__main__":
-    main()
