@@ -4,10 +4,18 @@
 #SBATCH --error=virac_lc_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=96
+# The 96‑core EPYC nodes in the core96 queue each have 256 GB of RAM.  Requesting
+# one of these nodes allows us to run the maximum number of parallel workers
+# available on a single compute node.  See the cluster documentation on queues
+# and architecture for details【663148948527848†L6-L14】【549210836745242†L24-L31】.
+# In accordance with the fair‑share policy, jobs may run up to one week and
+# users may consume up to 256 cores × 1 week of processor time【344885532347030†L23-L29】.  We
+# therefore set the walltime to 7 days to allow the extractor to run for the
+# maximum permitted duration【663148948527848†L18-L22】.
 #SBATCH --mem=256G
-#SBATCH --time=24:00:00
-#SBATCH --partition=compute
+#SBATCH --time=7-00:00:00
+#SBATCH --partition=core96
 
 # ==============================================================================
 # VIRAC Light Curve Extraction Job
@@ -23,9 +31,14 @@
 # ==============================================================================
 
 # Load required modules (adjust for your system)
-module purge
-module load python/3.9
-module load hdf5
+##
+# The cluster uses environment modules, but the standard `module` function is
+# defined only for login shells.  In batch scripts, call the module command via
+# modulecmd so that the appropriate environment variables are set【917054095551098†L24-L33】.
+# First purge any previously loaded modules, then load Python and HDF5.
+eval $(/usr/bin/modulecmd bash purge)
+eval $(/usr/bin/modulecmd bash load python/3.9)
+eval $(/usr/bin/modulecmd bash load hdf5)
 
 # Set environment variables for better HDF5 performance
 export HDF5_USE_FILE_LOCKING=FALSE
@@ -38,7 +51,12 @@ cd $SLURM_SUBMIT_DIR
 INPUT_DIR="/beegfs/car/lsmith/virac_v2/data/output/ts_tables/"
 OUTPUT_DIR="/beegfs/car/njm/virac_lightcurves/"
 MIN_KS=20
-WORKERS=64
+# Use all of the CPUs allocated to this job for the worker processes.  The
+# extractor script uses the `--workers` option to set the number of parallel
+# processes; setting this to the Slurm cpus‑per‑task means we utilise the full
+# capacity of the allocated core96 node.  If you modify `--ntasks` and
+# `--cpus-per-task` in the directives above, adjust this accordingly.
+WORKERS="$SLURM_CPUS_PER_TASK"
 
 # Print job info
 echo "=============================================="
