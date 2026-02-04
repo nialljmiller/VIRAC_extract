@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-VIRAC Extraction Progress Monitor (Optimized)
-==============================================
-Displays real-time progress without crashing on millions of files.
-Calculates stats from checkpoint JSONs instead of filesystem scanning.
+VIRAC Extraction Progress Monitor (Quality Control Edition)
+===========================================================
+Displays real-time progress and performs deep integrity checks on random files.
+Safe to run on directories with millions of files.
 """
 
 import os
@@ -30,13 +30,8 @@ def load_json_safe(filepath: Path) -> dict:
 
 
 def get_directory_size_fast(path: Path, timeout: int = 2) -> str:
-    """
-    Get directory size using 'du' command with a timeout.
-    Avoids Python's slow recursive glob.
-    """
+    """Get directory size using 'du' with timeout."""
     try:
-        # Run 'du -sh' (summarize, human-readable)
-        # using a short timeout so we don't hang if the filesystem is slow
         result = subprocess.run(
             ['du', '-sh', str(path)], 
             capture_output=True, 
@@ -44,7 +39,7 @@ def get_directory_size_fast(path: Path, timeout: int = 2) -> str:
             timeout=timeout
         )
         if result.returncode == 0:
-            return result.stdout.split()[0]  # Returns e.g., "150G"
+            return result.stdout.split()[0]
     except subprocess.TimeoutExpired:
         return "Calculating..."
     except Exception:
@@ -52,8 +47,60 @@ def get_directory_size_fast(path: Path, timeout: int = 2) -> str:
     return "N/A"
 
 
+def get_sample_files(directory: Path, n: int = 5) -> list:
+    """
+    Efficiently grab 'n' arbitrary CSV files using scandir.
+    Does NOT attempt to list the full directory.
+    """
+    samples = []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.endswith('.csv'):
+                    samples.append(Path(entry.path))
+                    if len(samples) >= n:
+                        break
+    except Exception:
+        return []
+    return samples
+
+
+def inspect_file_health(filepath: Path) -> dict:
+    """Read file head and verify integrity."""
+    result = {
+        "valid": False,
+        "head": [],
+        "error": None,
+        "size": 0
+    }
+    try:
+        result["size"] = filepath.stat().st_size
+        if result["size"] == 0:
+            result["error"] = "File is empty (0 bytes)"
+            return result
+        
+        with open(filepath, 'r') as f:
+            # Read first 4 lines
+            lines = [f.readline() for _ in range(4)]
+            result["head"] = [L.strip() for L in lines if L]
+            
+        # Check Header
+        expected_start = "mjd,ks_mag,ks_err"
+        if not result["head"] or not result["head"][0].startswith(expected_start):
+            result["error"] = "Invalid CSV Header"
+        elif len(result["head"]) < 2:
+            result["error"] = "File contains header only (no data)"
+        else:
+            result["valid"] = True
+            
+    except Exception as e:
+        result["error"] = str(e)
+        
+    return result
+
+
 def display_progress(output_dir: str, clear: bool = True):
-    """Display current progress statistics."""
+    """Display progress and quality checks."""
     output_dir = Path(output_dir)
     checkpoint_dir = output_dir / "checkpoints"
     
@@ -67,56 +114,70 @@ def display_progress(output_dir: str, clear: bool = True):
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("-" * 70)
     
-    # Load checkpoint files
+    # --- Load Stats ---
     completed_data = load_json_safe(checkpoint_dir / "completed_tiles.json")
     failed_data = load_json_safe(checkpoint_dir / "failed_tiles.json")
     progress_data = load_json_safe(checkpoint_dir / "progress.json")
     
-    # 1. Calculate stats from "Completed Tiles" (Source of Truth)
-    # The 'stats' dict contains the exact number of valid sources per tile
     stats = completed_data.get("stats", {})
     completed_list = completed_data.get("completed", [])
     
     n_completed = len(completed_list)
     n_failed = len(failed_data.get("failed", {}))
     
-    # Sum up valid sources (which equals number of CSV files)
-    # We iterate over the stats dictionary which is much faster than ls/glob
     real_csv_count = sum(item.get("n_valid", 0) for item in stats.values())
     real_source_count = sum(item.get("n_sources", 0) for item in stats.values())
     
-    # 2. Get Global Progress if available
-    total_tiles = progress_data.get("total_tiles", 22585) # Default to known total if missing
-    
-    if total_tiles > 0:
-        percent = (n_completed / total_tiles) * 100
-    else:
-        percent = 0.0
+    total_tiles = progress_data.get("total_tiles", 22585)
+    percent = (n_completed / total_tiles * 100) if total_tiles > 0 else 0.0
 
     print(f"Tiles Completed:   {n_completed:,} / {total_tiles:,} ({percent:.1f}%)")
     print(f"Tiles Failed:      {n_failed:,}")
-    print("-" * 70)
-    
     print(f"Sources Scanned:   {real_source_count:,}")
     print(f"Valid Sources:     {real_csv_count:,} (Files Written)")
     
-    # 3. Disk Usage (Safe Method)
-    # Only try to calculate size if we are in watch mode or specifically requested,
-    # because even 'du' can be slow on huge directories.
-    dir_size = get_directory_size_fast(output_dir)
-    print(f"Disk Usage:        {dir_size}")
+    # --- Quality Control Section ---
+    print("-" * 70)
+    print("QUALITY CONTROL & SANITY CHECKS")
+    print("-" * 70)
     
+    samples = get_sample_files(output_dir, n=5)
+    
+    if not samples:
+        print("Waiting for files to be created...")
+    else:
+        print(f"Sample filenames on disk: {[f.name for f in samples]}")
+        print("-" * 70)
+        
+        # Inspect 3 files for deep check
+        files_to_inspect = samples[:3]
+        all_passed = True
+        
+        for fpath in files_to_inspect:
+            health = inspect_file_health(fpath)
+            status = "PASS" if health["valid"] else f"FAIL [{health['error']}]"
+            if not health["valid"]: all_passed = False
+            
+            print(f"File: {fpath.name}")
+            print(f"Size: {health['size']} bytes | Integrity: {status}")
+            print("Preview:")
+            for i, line in enumerate(health["head"]):
+                print(f"  {i+1}: {line}")
+            print("")
+            
+        print("-" * 70)
+        if all_passed:
+            print("System Health: OK (Files appear valid and populated)")
+        else:
+            print("System Health: WARNING (Detected malformed or empty files)")
+
     print("=" * 70)
     
-    # Show recent failures if any
     if n_failed > 0:
-        print("\nRecent failures:")
-        # Show last 5 failures
+        print("\nRecent Tile Failures:")
         recent_fails = list(failed_data.get("failed", {}).items())[-5:]
         for tile_id, info in recent_fails:
-            err = info.get('error', 'Unknown')
-            # Truncate error message to fit on screen
-            print(f"  {tile_id}: {err[:80]}...")
+            print(f"  {tile_id}: {info.get('error', 'Unknown')[:80]}...")
 
 
 def watch_progress(output_dir: str, interval: int = 10):
@@ -131,25 +192,10 @@ def watch_progress(output_dir: str, interval: int = 10):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Monitor VIRAC light curve extraction progress (Safe Mode)"
-    )
-    parser.add_argument(
-        "--output-dir", "-o",
-        default=DEFAULT_OUTPUT_DIR,
-        help="Output directory to monitor"
-    )
-    parser.add_argument(
-        "--watch", "-w",
-        action="store_true",
-        help="Continuously watch progress"
-    )
-    parser.add_argument(
-        "--interval", "-i",
-        type=int,
-        default=30,
-        help="Refresh interval in seconds"
-    )
+    parser = argparse.ArgumentParser(description="Monitor VIRAC Extraction (QC Mode)")
+    parser.add_argument("--output-dir", "-o", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--watch", "-w", action="store_true")
+    parser.add_argument("--interval", "-i", type=int, default=30)
     
     args = parser.parse_args()
     
