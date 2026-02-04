@@ -13,7 +13,7 @@
 # users may consume up to 256 cores × 1 week of processor time【344885532347030†L23-L29】.  We
 # therefore set the walltime to 7 days to allow the extractor to run for the
 # maximum permitted duration【663148948527848†L18-L22】.
-#SBATCH --mem=256G
+#SBATCH --mem=2G
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=core96
 
