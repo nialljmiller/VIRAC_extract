@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-VIRAC Extraction Progress Monitor
-==================================
-Displays real-time progress and statistics for the extraction process.
-
-Usage:
-    python monitor_progress.py [--output-dir PATH] [--watch]
+VIRAC Extraction Progress Monitor (Optimized)
+==============================================
+Displays real-time progress without crashing on millions of files.
+Calculates stats from checkpoint JSONs instead of filesystem scanning.
 """
 
 import os
 import sys
 import json
 import argparse
+import subprocess
 from pathlib import Path
 from datetime import datetime
 import time
@@ -30,32 +29,27 @@ def load_json_safe(filepath: Path) -> dict:
         return {}
 
 
-def count_csv_files(output_dir: Path) -> int:
-    """Count CSV files in output directory."""
+def get_directory_size_fast(path: Path, timeout: int = 2) -> str:
+    """
+    Get directory size using 'du' command with a timeout.
+    Avoids Python's slow recursive glob.
+    """
     try:
-        return len(list(output_dir.glob("*.csv")))
-    except:
-        return 0
-
-
-def format_bytes(size: int) -> str:
-    """Format bytes to human-readable string."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if abs(size) < 1024.0:
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} PB"
-
-
-def get_dir_size(path: Path) -> int:
-    """Get total size of directory in bytes."""
-    try:
-        total = 0
-        for f in path.glob("*.csv"):
-            total += f.stat().st_size
-        return total
-    except:
-        return 0
+        # Run 'du -sh' (summarize, human-readable)
+        # using a short timeout so we don't hang if the filesystem is slow
+        result = subprocess.run(
+            ['du', '-sh', str(path)], 
+            capture_output=True, 
+            text=True, 
+            timeout=timeout
+        )
+        if result.returncode == 0:
+            return result.stdout.split()[0]  # Returns e.g., "150G"
+    except subprocess.TimeoutExpired:
+        return "Calculating..."
+    except Exception:
+        pass
+    return "N/A"
 
 
 def display_progress(output_dir: str, clear: bool = True):
@@ -73,56 +67,56 @@ def display_progress(output_dir: str, clear: bool = True):
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("-" * 70)
     
-    # Load progress file
-    progress = load_json_safe(checkpoint_dir / "progress.json")
+    # Load checkpoint files
+    completed_data = load_json_safe(checkpoint_dir / "completed_tiles.json")
+    failed_data = load_json_safe(checkpoint_dir / "failed_tiles.json")
+    progress_data = load_json_safe(checkpoint_dir / "progress.json")
     
-    if progress:
-        total_tiles = progress.get("total_tiles", 0)
-        processed_tiles = progress.get("processed_tiles", 0)
-        total_sources = progress.get("total_sources", 0)
-        valid_sources = progress.get("valid_sources", 0)
-        percent = progress.get("percent_complete", 0)
-        last_update = progress.get("last_update", "N/A")
-        
-        print(f"Tiles:     {processed_tiles:,} / {total_tiles:,} ({percent:.1f}%)")
-        print(f"Sources processed: {total_sources:,}")
-        print(f"Valid sources:     {valid_sources:,}")
-        print(f"Last update:       {last_update}")
+    # 1. Calculate stats from "Completed Tiles" (Source of Truth)
+    # The 'stats' dict contains the exact number of valid sources per tile
+    stats = completed_data.get("stats", {})
+    completed_list = completed_data.get("completed", [])
+    
+    n_completed = len(completed_list)
+    n_failed = len(failed_data.get("failed", {}))
+    
+    # Sum up valid sources (which equals number of CSV files)
+    # We iterate over the stats dictionary which is much faster than ls/glob
+    real_csv_count = sum(item.get("n_valid", 0) for item in stats.values())
+    real_source_count = sum(item.get("n_sources", 0) for item in stats.values())
+    
+    # 2. Get Global Progress if available
+    total_tiles = progress_data.get("total_tiles", 22585) # Default to known total if missing
+    
+    if total_tiles > 0:
+        percent = (n_completed / total_tiles) * 100
     else:
-        print("No progress data available yet.")
-    
+        percent = 0.0
+
+    print(f"Tiles Completed:   {n_completed:,} / {total_tiles:,} ({percent:.1f}%)")
+    print(f"Tiles Failed:      {n_failed:,}")
     print("-" * 70)
     
-    # Load completed tiles
-    completed = load_json_safe(checkpoint_dir / "completed_tiles.json")
-    n_completed = len(completed.get("completed", []))
-    print(f"Completed tiles: {n_completed:,}")
+    print(f"Sources Scanned:   {real_source_count:,}")
+    print(f"Valid Sources:     {real_csv_count:,} (Files Written)")
     
-    # Load failed tiles
-    failed = load_json_safe(checkpoint_dir / "failed_tiles.json")
-    n_failed = len(failed.get("failed", {}))
-    print(f"Failed tiles:    {n_failed:,}")
-    
-    print("-" * 70)
-    
-    # Count actual CSV files
-    n_csv = count_csv_files(output_dir)
-    dir_size = get_dir_size(output_dir)
-    
-    print(f"CSV files on disk: {n_csv:,}")
-    print(f"Total size:        {format_bytes(dir_size)}")
-    
-    if n_csv > 0:
-        avg_size = dir_size / n_csv
-        print(f"Avg file size:     {format_bytes(avg_size)}")
+    # 3. Disk Usage (Safe Method)
+    # Only try to calculate size if we are in watch mode or specifically requested,
+    # because even 'du' can be slow on huge directories.
+    dir_size = get_directory_size_fast(output_dir)
+    print(f"Disk Usage:        {dir_size}")
     
     print("=" * 70)
     
     # Show recent failures if any
-    if n_failed > 0 and n_failed <= 10:
+    if n_failed > 0:
         print("\nRecent failures:")
-        for tile_id, info in list(failed.get("failed", {}).items())[-5:]:
-            print(f"  {tile_id}: {info.get('error', 'Unknown')[:60]}")
+        # Show last 5 failures
+        recent_fails = list(failed_data.get("failed", {}).items())[-5:]
+        for tile_id, info in recent_fails:
+            err = info.get('error', 'Unknown')
+            # Truncate error message to fit on screen
+            print(f"  {tile_id}: {err[:80]}...")
 
 
 def watch_progress(output_dir: str, interval: int = 10):
@@ -138,7 +132,7 @@ def watch_progress(output_dir: str, interval: int = 10):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monitor VIRAC light curve extraction progress"
+        description="Monitor VIRAC light curve extraction progress (Safe Mode)"
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -153,8 +147,8 @@ def main():
     parser.add_argument(
         "--interval", "-i",
         type=int,
-        default=10,
-        help="Refresh interval in seconds (for watch mode)"
+        default=30,
+        help="Refresh interval in seconds"
     )
     
     args = parser.parse_args()
