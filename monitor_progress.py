@@ -1,7 +1,9 @@
+#!/usr/bin/env python3
 """
-VIRAC Extraction Progress Monitor (Fixed & Robust)
-==================================================
-Monitors progress, checks data integrity, and tracks coverage of PRIMVS targets.
+VIRAC Extraction Progress Monitor (With Target List Support)
+============================================================
+Includes specific coverage check for PRIMVS_ID.csv targets.
+Auto-switches to statistical sampling if target list is huge.
 """
 
 import os
@@ -30,7 +32,9 @@ def load_json_safe(filepath: Path) -> dict:
 def get_primvs_coverage(output_dir: Path) -> dict:
     """
     Calculate coverage of IDs in PRIMVS_ID.csv.
+    Uses sampling if list is large to preserve performance.
     """
+    # Look for CSV in the same directory as this script
     script_dir = Path(__file__).parent.resolve()
     primvs_path = script_dir / PRIMVS_FILENAME
     
@@ -51,39 +55,28 @@ def get_primvs_coverage(output_dir: Path) -> dict:
 
     try:
         with open(primvs_path, 'r') as f:
-            # Try to read header to find specific 'sourceid' column
-            sample = f.read(1024)
-            f.seek(0)
-            has_header = csv.Sniffer().has_header(sample)
+            reader = csv.DictReader(f)
+            # Handle potential whitespace in headers
+            headers = [h.strip() for h in reader.fieldnames]
             
-            if has_header:
-                reader = csv.DictReader(f)
-                headers = [h.strip().lower() for h in reader.fieldnames]
-                # Find column containing 'sourceid'
-                id_col = next((h for h in headers if "sourceid" in h), None)
-                
-                if id_col:
-                    # Reset and read using the found column
-                    f.seek(0)
-                    reader = csv.DictReader(f)
-                    # Use the exact column name from fieldnames to avoid key errors
-                    actual_col = [h for h in reader.fieldnames if h.strip().lower() == id_col][0]
-                    ids = [row[actual_col].strip() for row in reader if row[actual_col]]
-                else:
-                    # Header exists but no 'sourceid' column? Fallback to col 0
-                    f.seek(0)
-                    next(f) # skip header
-                    ids = [line.split(',')[0].strip() for line in f if line.strip()]
-            else:
-                # No header, assume first column
+            # Identify the ID column (case insensitive)
+            id_col = next((h for h in headers if "sourceid" in h.lower()), None)
+            
+            if not id_col:
+                # Fallback: try first column if no header match
+                f.seek(0)
+                next(f) # Skip header
                 ids = [line.split(',')[0].strip() for line in f if line.strip()]
+            else:
+                # Re-read with correct column
+                f.seek(0)
+                reader = csv.DictReader(f)
+                ids = [row[id_col].strip() for row in reader if row[id_col]]
                 
         result["total_targets"] = len(ids)
         
-        if result["total_targets"] == 0:
-            return result
-
-        # SMART SAMPLING: Check max 2000 IDs to save I/O
+        # SMART SAMPLING:
+        # If list is huge, check a random sample to save filesystem I/O
         if len(ids) > 5000:
             check_ids = random.sample(ids, 2000)
             result["method"] = "sampled (2k)"
@@ -91,27 +84,38 @@ def get_primvs_coverage(output_dir: Path) -> dict:
             check_ids = ids
             result["method"] = "exact"
             
-        # Explicitly set checked_count based on the list we are about to iterate
         result["checked_count"] = len(check_ids)
         
         # Check existence
         hits = 0
         for source_id in check_ids:
-            # Check fast: construct path once
             if (output_dir / f"{source_id}.csv").exists():
                 hits += 1
         
         result["hits"] = hits
-        
         if result["checked_count"] > 0:
             result["percentage"] = (hits / result["checked_count"]) * 100
-        else:
-            result["percentage"] = 0.0
             
     except Exception as e:
-        print(f"Error reading target list: {e}")
+        print(f"Error reading {PRIMVS_FILENAME}: {e}")
         
     return result
+
+def get_directory_size_fast(path: Path, timeout: int = 2) -> str:
+    try:
+        result = subprocess.run(
+            ['du', '-sh', str(path)], 
+            capture_output=True, 
+            text=True, 
+            timeout=timeout
+        )
+        if result.returncode == 0:
+            return result.stdout.split()[0]
+    except subprocess.TimeoutExpired:
+        return "Calculating..."
+    except Exception:
+        pass
+    return "N/A"
 
 def get_sample_files(directory: Path, n: int = 5) -> list:
     samples = []
@@ -162,7 +166,7 @@ def display_progress(output_dir: str, clear: bool = True):
     print(f"Time:   {datetime.now().strftime('%H:%M:%S')}")
     print("-" * 70)
     
-    # Load Stats
+    # Stats
     completed_data = load_json_safe(checkpoint_dir / "completed_tiles.json")
     failed_data = load_json_safe(checkpoint_dir / "failed_tiles.json")
     progress_data = load_json_safe(checkpoint_dir / "progress.json")
@@ -171,7 +175,6 @@ def display_progress(output_dir: str, clear: bool = True):
     n_completed = len(completed_data.get("completed", []))
     n_failed = len(failed_data.get("failed", {}))
     
-    # Calculate totals
     real_csv_count = sum(item.get("n_valid", 0) for item in stats.values())
     real_source_count = sum(item.get("n_sources", 0) for item in stats.values())
     total_tiles = progress_data.get("total_tiles", 22585)
@@ -180,7 +183,6 @@ def display_progress(output_dir: str, clear: bool = True):
 
     print(f"Tiles:   {n_completed:,} / {total_tiles:,} ({percent:.1f}%)")
     print(f"Sources: {real_source_count:,} scanned -> {real_csv_count:,} saved")
-    print(f"Errors:  {n_failed} failed tiles")
     
     # --- PRIMVS COVERAGE CHECK ---
     print("-" * 70)
@@ -191,11 +193,11 @@ def display_progress(output_dir: str, clear: bool = True):
         print(f"Coverage: {p_str} ({primvs['hits']}/{primvs['checked_count']} found)")
         print(f"Total IDs: {primvs['total_targets']:,} | Method: {primvs['method']}")
     else:
-        print(f"Target list '{PRIMVS_FILENAME}' not found.")
+        print(f"Target list '{PRIMVS_FILENAME}' not found (skipping coverage check)")
 
     # --- QC ---
     print("-" * 70)
-    samples = get_sample_files(output_dir, n=1)
+    samples = get_sample_files(output_dir, n=3)
     if samples:
         print(f"QC Sample ({samples[0].name}):")
         health = inspect_file_health(samples[0])
@@ -208,12 +210,6 @@ def display_progress(output_dir: str, clear: bool = True):
         print("Waiting for files...")
 
     print("=" * 70)
-    
-    if n_failed > 0:
-        print("Recent Failures:")
-        fails = list(failed_data.get("failed", {}).items())[-3:]
-        for t, err in fails:
-            print(f"  {t}: {err['error'][:60]}")
 
 def watch_progress(output_dir: str, interval: int = 10):
     print(f"Watching... (Ctrl+C to stop)")
