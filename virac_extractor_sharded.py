@@ -87,10 +87,12 @@ class CheckpointManager:
         return {}
     
     def _save_json(self, filepath: Path, data: dict):
-        temp_file = filepath.with_suffix('.tmp')
-        with open(temp_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        temp_file.replace(filepath)
+            # Use PID to ensure unique temp file per process
+            temp_file = filepath.with_suffix(f'.tmp.{os.getpid()}') 
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(filepath)
+    
     
     def get_completed_tiles(self) -> set:
         fd = self._acquire_lock()
