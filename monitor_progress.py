@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-VIRAC Extraction Progress Monitor (Dashboard Edition)
-=====================================================
-- Global Stats & Completion %
-- Live Status of Each Shard (Active Tile & Speed)
-- PRIMVS Target Coverage
-- Data Integrity Checks
+VIRAC Extraction Monitor (Ultimate Edition)
+===========================================
+Combines real-time log parsing (Dashboard) with deep data integrity checks (QC).
+Features:
+- Global Progress Stats
+- Live per-shard status table (Tile ID, Progress, Speed)
+- PRIMVS Target List Coverage
+- Deep CSV Integrity Inspection (Header & Row checks)
 """
 
 import os
@@ -38,16 +40,11 @@ def load_json_safe(filepath: Path) -> dict:
         return {}
 
 def get_latest_logs(directory: Path) -> dict:
-    """
-    Finds the most recent .err log file for each shard index.
-    Returns: {shard_index: filepath}
-    """
+    """Finds the most recent .err log file for each shard index."""
     shard_logs = {}
     pattern = re.compile(r"virac_shard_(\d+)_(\d+)\.err")
     
-    # glob all .err files in the current directory (where script is running)
-    # or look in output_dir/logs if that's where they are.
-    # Based on your 'll', they are in the current dir.
+    # Look in current directory for log files
     log_files = glob.glob("virac_shard_*_*.err")
     
     for log_file in log_files:
@@ -60,51 +57,45 @@ def get_latest_logs(directory: Path) -> dict:
             if shard_idx not in shard_logs:
                 shard_logs[shard_idx] = (job_id, log_file)
             else:
-                current_best_job = shard_logs[shard_idx][0]
-                if job_id > current_best_job:
+                if job_id > shard_logs[shard_idx][0]:
                     shard_logs[shard_idx] = (job_id, log_file)
     
     return {k: v[1] for k, v in shard_logs.items()}
 
 def parse_shard_status(log_file: str) -> dict:
     """Reads the tail of a log file to extract current status."""
-    status = {"tile": "Starting...", "progress": "N/A", "updated": "N/A"}
+    status = {"tile": "Starting...", "progress": "-", "batch": "-", "updated": "N/A"}
     
     try:
         fpath = Path(log_file)
-        if not fpath.exists():
-            return status
+        if not fpath.exists(): return status
             
         status["updated"] = datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%H:%M:%S')
         
-        # Read last 2KB
+        # Read last 4KB to catch recent updates
         file_size = fpath.stat().st_size
-        read_size = min(2048, file_size)
+        read_size = min(4096, file_size)
         
         with open(fpath, 'rb') as f:
             if file_size > read_size:
                 f.seek(-read_size, 2)
             lines = f.read().decode('utf-8', errors='ignore').splitlines()
             
-        # Find last INFO line with tile progress
-        # Format: "INFO - [55/5530] n1024_8954892: 9856/13849"
+        # Parse: "INFO - [55/5530] n1024_8954892: 9856/13849"
         prog_pattern = re.compile(r"\[(\d+/\d+)\]\s+(n\d+_\d+):\s+(\d+/\d+)")
         
         for line in reversed(lines):
             match = prog_pattern.search(line)
             if match:
+                status["batch"] = match.group(1)
                 status["tile"] = match.group(2)
                 status["progress"] = match.group(3)
-                # Add batch progress too
-                status["batch"] = match.group(1)
                 break
-                
-    except Exception:
-        pass
+    except: pass
     return status
 
 # =============================================================================
-# Coverage & QC
+# Coverage & QC Checks
 # =============================================================================
 
 def get_primvs_coverage(output_dir: Path) -> dict:
@@ -117,7 +108,7 @@ def get_primvs_coverage(output_dir: Path) -> dict:
 
     try:
         with open(primvs_path, 'r') as f:
-            # Quick check for header
+            # Check for header
             sample = f.read(1024); f.seek(0)
             has_header = csv.Sniffer().has_header(sample)
             
@@ -143,26 +134,44 @@ def get_primvs_coverage(output_dir: Path) -> dict:
         if result["checked"] > 0:
             result["pct"] = (hits / result["checked"]) * 100
             
-    except Exception: pass
+    except: pass
     return result
 
-def inspect_sample(output_dir: Path) -> dict:
+def get_sample_file(directory: Path) -> Path:
+    """Fast scandir to find one random CSV file."""
     try:
-        # Fast scandir for 1 file
-        with os.scandir(output_dir) as entries:
+        with os.scandir(directory) as entries:
             for entry in entries:
                 if entry.name.endswith('.csv'):
-                    fpath = Path(entry.path)
-                    sz = fpath.stat().st_size
-                    with open(fpath, 'r') as f:
-                        head = f.readline().strip()
-                        row = f.readline().strip()
-                    return {"name": entry.name, "size": sz, "valid": sz > 0 and "mjd" in head, "row": row}
+                    return Path(entry.path)
     except: pass
     return None
 
+def inspect_file_health(filepath: Path) -> dict:
+    """Deep inspection of CSV integrity."""
+    result = {"valid": False, "head": [], "error": None, "size": 0, "name": filepath.name}
+    try:
+        result["size"] = filepath.stat().st_size
+        if result["size"] == 0:
+            result["error"] = "Empty file (0B)"
+            return result
+        
+        with open(filepath, 'r') as f:
+            lines = [f.readline() for _ in range(3)]
+            result["head"] = [L.strip() for L in lines if L]
+            
+        if not result["head"] or "mjd" not in result["head"][0].lower():
+            result["error"] = "Invalid Header"
+        elif len(result["head"]) < 2:
+            result["error"] = "No Data Rows"
+        else:
+            result["valid"] = True
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
 # =============================================================================
-# Main Display
+# Main Dashboard
 # =============================================================================
 
 def display_progress(output_dir: str, clear: bool = True):
@@ -172,11 +181,13 @@ def display_progress(output_dir: str, clear: bool = True):
     if clear: os.system('clear' if os.name == 'posix' else 'cls')
     
     print("=" * 80)
-    print(f"VIRAC EXTRACTOR DASHBOARD  |  {datetime.now().strftime('%H:%M:%S')}")
+    print(f"VIRAC EXTRACTOR DASHBOARD  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80)
     
-    # --- Global Stats ---
+    # --- 1. Global Stats ---
     stats = load_json_safe(checkpoint_dir / "completed_tiles.json").get("stats", {})
+    failed = load_json_safe(checkpoint_dir / "failed_tiles.json").get("failed", {})
+    
     completed_len = len(stats)
     total_len = 22585
     pct = (completed_len / total_len * 100)
@@ -186,43 +197,51 @@ def display_progress(output_dir: str, clear: bool = True):
     
     print(f" GLOBAL PROGRESS:  {pct:5.1f}%  [{completed_len:,} / {total_len:,} Tiles]")
     print(f" FILES WRITTEN:    {n_csv:,} light curves ({n_src:,} scanned)")
+    if len(failed) > 0:
+        print(f" FAILURES:         {len(failed)} tiles (Check logs!)")
     print("-" * 80)
 
-    # --- Live Shard Status ---
-    print(f" {'SHARD':<6} | {'STATUS':<12} | {'CURRENT TILE':<15} | {'PROGRESS':<15} | {'UPDATED'}")
+    # --- 2. Live Shard Table ---
+    print(f" {'ID':<4} | {'STATUS':<10} | {'BATCH':<10} | {'TILE ID':<15} | {'PROGRESS':<14} | {'UPDATED'}")
     print("-" * 80)
     
     logs = get_latest_logs(Path("."))
     active_shards = sorted(logs.keys())
     
-    # Only show relevant shards (0-3 usually, ignoring cancelled ones if possible)
-    # If list is huge, maybe slice it. For now show all found.
     for shard_idx in active_shards:
-        if shard_idx > 3 and shard_idx < 90: continue # Skip the dead ones if they exist
+        if shard_idx > 3: continue # Hide cancelled shards
         
         info = parse_shard_status(logs[shard_idx])
         
-        # Color coding status roughly
         state = "ACTIVE"
         if "Starting" in info['tile']: state = "INIT"
         
-        # Clean print
-        tile_str = info.get('tile', '-')
-        prog_str = info.get('progress', '-')
-        
-        print(f" {shard_idx:<6} | {state:<12} | {tile_str:<15} | {prog_str:<15} | {info['updated']}")
+        print(f" {shard_idx:<4} | {state:<10} | {info['batch']:<10} | {info['tile']:<15} | {info['progress']:<14} | {info['updated']}")
 
     print("-" * 80)
 
-    # --- Targets & QC ---
+    # --- 3. Coverage ---
     primvs = get_primvs_coverage(output_dir)
     if primvs["found"]:
         print(f" TARGETS: {primvs['pct']:5.2f}% found in PRIMVS_ID.csv {primvs['note']}")
+    else:
+        print(" TARGETS: PRIMVS_ID.csv not found.")
+
+    # --- 4. Deep QC ---
+    sample_file = get_sample_file(output_dir)
+    if sample_file:
+        qc = inspect_file_health(sample_file)
+        status = "PASS" if qc['valid'] else f"FAIL [{qc['error']}]"
         
-    qc = inspect_sample(output_dir)
-    if qc:
-        status = "PASS" if qc['valid'] else "FAIL"
-        print(f" QC CHECK: {status} on {qc['name']} ({qc['size']} bytes)")
+        print("-" * 80)
+        print(f" QC SAMPLE: {qc['name']} | Size: {qc['size']} bytes | Integrity: {status}")
+        if qc['head']:
+            print(f"   Header: {qc['head'][0][:70]}...")
+            if len(qc['head']) > 1:
+                print(f"   Row 1:  {qc['head'][1][:70]}...")
+    else:
+        print("-" * 80)
+        print(" QC SAMPLE: Waiting for files...")
 
     print("=" * 80)
 
