@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-VIRAC Extraction Cockpit (Fixed & Final)
-========================================
-- RELIABLE Resource Monitoring (squeue + sstat integration)
-- Recent File Activity Tracker
-- Full File Content Preview
-- Real-time Shard Status
+VIRAC Extraction Cockpit (Robust Squeue Edition)
+================================================
+- Robust squeue parsing (Handling [0-9] ranges)
+- Accurate Resource Stats (Memory/CPU)
+- Real-time File Activity
 """
 
 import os
@@ -23,6 +22,7 @@ import time
 
 DEFAULT_OUTPUT_DIR = "/beegfs/car/njm/virac_lightcurves/"
 PRIMVS_FILENAME = "PRIMVS_ID.csv"
+# Get user safely, default to njm if not found
 USER = os.environ.get('USER', 'njm')
 
 # =============================================================================
@@ -47,41 +47,82 @@ def get_latest_logs(directory: Path) -> dict:
                 shard_logs[shard_idx] = (job_id, log_file)
     return shard_logs
 
+def parse_slurm_range(range_str: str) -> list:
+    """Expands Slurm ranges like '6-19' or '1,3,5-7' into a list of integers."""
+    ids = []
+    try:
+        parts = range_str.split(',')
+        for p in parts:
+            if '-' in p:
+                start, end = map(int, p.split('-'))
+                ids.extend(range(start, end + 1))
+            else:
+                ids.append(int(p))
+    except: pass
+    return ids
+
 def get_active_jobs_info():
     """
-    Get mapping of Shard ID -> Slurm Job Info using squeue.
-    This is the Source of Truth for "Active" vs "Dead".
+    Get mapping of Shard ID -> Slurm Job Info by parsing Job ID strings.
+    Handles '233251_0' (Active) and '233251_[6-19]' (Pending).
     """
     mapping = {}
     try:
-        # Get Array Task ID (%K) and Job ID (%i)
-        cmd = ['squeue', '-u', USER, '--name=virac_sh', '-h', '-o', '%K %i %t %M']
+        # Get JobID, State, Time, Reason
+        cmd = ['squeue', '-u', USER, '-h', '-o', '%i %t %M %r']
         res = subprocess.run(cmd, capture_output=True, text=True)
         
+        # Regex to parse '12345_1' or '12345_[1-5]'
+        # Capture groups: 1=BaseID, 2=IndexOrRange
+        id_pattern = re.compile(r"(\d+)_(\[.*?\]|\d+)")
+
         for line in res.stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 3:
-                task_id_str = parts[0] # Array index (Shard ID)
-                job_id = parts[1]
-                state = parts[2]
+            if len(parts) < 3: continue
+            
+            job_str = parts[0]
+            state = parts[1]
+            time_str = parts[2]
+            
+            match = id_pattern.search(job_str)
+            if match:
+                base_id = match.group(1)
+                suffix = match.group(2)
                 
-                # Handle array ranges if necessary (though virac_sh usually expands)
-                # Usually squeue shows individual tasks for running jobs
-                if task_id_str.isdigit():
-                    mapping[int(task_id_str)] = {
-                        'job_id': job_id,
+                # Check for brackets [6-19]
+                if '[' in suffix:
+                    # Remove brackets and parse range
+                    inner = suffix.replace('[', '').replace(']', '')
+                    indices = parse_slurm_range(inner)
+                    for idx in indices:
+                        mapping[idx] = {
+                            'job_id': f"{base_id}_{idx}", # Synthesize full ID
+                            'state': state,
+                            'time': time_str,
+                            'is_range': True
+                        }
+                else:
+                    # Single ID
+                    idx = int(suffix)
+                    mapping[idx] = {
+                        'job_id': job_str,
                         'state': state,
-                        'time': parts[3]
+                        'time': time_str,
+                        'is_range': False
                     }
-    except: pass
+    except Exception as e: 
+        # Fail silently but could print e for debug
+        pass
     return mapping
 
 def get_slurm_resources(active_shard_map):
     """
-    Query 'sstat' for running jobs.
+    Query 'sstat' for running jobs to get usage.
     """
     stats = {}
-    job_ids = [info['job_id'] for info in active_shard_map.values() if info['state'] == 'R']
+    # Only query running jobs (R) that are single IDs (not ranges)
+    job_ids = [info['job_id'] for info in active_shard_map.values() 
+               if info['state'] == 'R' and not info.get('is_range')]
     
     if not job_ids: return stats
     
@@ -92,13 +133,13 @@ def get_slurm_resources(active_shard_map):
         res = subprocess.run(cmd, capture_output=True, text=True)
         
         for line in res.stdout.splitlines():
-            # 233105_0.batch|429496K|95.2%
+            # Output: 233251_0.batch|429496K|95.2%
             parts = line.strip().split('|')
             if len(parts) >= 3:
                 full_id = parts[0]
-                # Extract the base Job ID (233105_0)
-                base_id = full_id.split('.')[0]
+                base_id = full_id.split('.')[0] # 233251_0
                 
+                # We want the main batch step stats
                 if 'batch' in full_id or full_id == base_id:
                     stats[base_id] = {'rss': parts[1], 'cpu': parts[2]}
     except: pass
@@ -135,7 +176,6 @@ def parse_shard_status(log_file: str) -> dict:
 # =============================================================================
 
 def get_recent_files(directory: Path, scan_limit: int = 3000):
-    """Scan directory for the absolute newest files."""
     files_found = []
     try:
         count = 0
@@ -146,8 +186,6 @@ def get_recent_files(directory: Path, scan_limit: int = 3000):
                     count += 1
                     if count >= scan_limit: break
     except: pass
-    
-    # Sort by time descending (newest first)
     files_found.sort(key=lambda x: x[0], reverse=True)
     return files_found[:5]
 
@@ -226,7 +264,7 @@ def display_progress(output_dir: str, clear: bool = True):
 
     # 2. Live Resource Table
     logs = get_latest_logs(Path("."))
-    active_shards = get_active_jobs_info() # Squeue data
+    active_shards = get_active_jobs_info() # Squeue data (Truth)
     resources = get_slurm_resources(active_shards) # Sstat data
 
     print(f" {'ID':<3} | {'STATUS':<9} | {'MEM (RSS)':<10} | {'CPU (Avg)':<10} | {'BATCH':<9} | {'TILE ID':<14} | {'PROGRESS':<12} | {'UPDATED'}")
@@ -234,10 +272,10 @@ def display_progress(output_dir: str, clear: bool = True):
 
     total_rss = 0.0
     
-    # Merge log info with queue info
-    all_shard_ids = sorted(list(set(list(logs.keys()) + list(active_shards.keys()))))
+    # Merge log IDs and Queue IDs to show everything
+    all_ids = sorted(list(set(list(logs.keys()) + list(active_shards.keys()))))
     
-    for shard_idx in all_shard_ids:
+    for shard_idx in all_ids:
         # Get Log Info
         log_info = parse_shard_status(logs[shard_idx][1]) if shard_idx in logs else {}
         
@@ -251,18 +289,18 @@ def display_progress(output_dir: str, clear: bool = True):
         if slurm_state == 'R': display_state = "ACTIVE"
         elif slurm_state == 'PD': display_state = "PENDING"
         elif slurm_state == 'MISSING': 
-             # If missing from queue, but log updated recently, might be finishing up?
-             # Or it's dead.
              if log_info.get('age_seconds', 9999) < 600: display_state = "FINISHING"
              else: display_state = "DEAD"
 
-        # If Pending, log info is irrelevant/old
+        # If Pending, log info is invalid
         if display_state == "PENDING":
             log_info = {"batch": "-", "tile": "(Queued)", "progress": "-", "updated": "-"}
-
+            
         # Get Resources
-        usage = resources.get(job_id, {'rss': '-', 'cpu': '-'})
-        
+        usage = {'rss': '-', 'cpu': '-'}
+        if job_id in resources:
+            usage = resources[job_id]
+
         # Sum Memory
         try:
             val = float(re.sub(r'[a-zA-Z]', '', usage['rss']))
@@ -285,10 +323,9 @@ def display_progress(output_dir: str, clear: bool = True):
             ts = datetime.fromtimestamp(t).strftime('%H:%M:%S')
             print(f"   [{ts}] {name} ({size} bytes)")
         
-        # QC the very newest one
+        # QC newest
         latest_file = Path(recents[0][1])
         qc = inspect_file_health(latest_file)
-        
         print("-" * 95)
         print(f" INTEGRITY CHECK: {qc['name']}")
         print(f"   Status: {('PASS' if qc['valid'] else 'FAIL')} [{qc.get('error','')}]")
