@@ -1,0 +1,13 @@
+ERROR: Unable to locate a modulefile for 'python/3.9'
+ERROR: Unable to locate a modulefile for 'hdf5'
+2026-02-05 22:04:09,173 - INFO - ======================================================================
+2026-02-05 22:04:09,175 - INFO - VIRAC Extractor - Shard 6/32
+2026-02-05 22:04:09,175 - INFO - ======================================================================
+2026-02-05 22:04:09,176 - INFO - Total tiles in dataset: 22585
+2026-02-05 22:04:09,177 - INFO - Tiles for this shard:   706
+2026-02-05 22:04:09,178 - INFO - Workers: 32
+2026-02-05 22:04:09,189 - INFO - Already completed: 120
+2026-02-05 22:04:09,190 - INFO - Tiles to process:  586
+2026-02-05 22:05:22,227 - INFO - [1/586] n1024_9352196: 1804/15702
+2026-02-05 22:05:42,053 - INFO - [2/586] n1024_9319433: 5061/16855
+slurmstepd: error: *** JOB 233248 ON node113 CANCELLED AT 2026-02-05T22:05:55 ***

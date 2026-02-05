@@ -291,6 +291,11 @@ def process_tile(args: Tuple[str, str, str, int]) -> Tuple[str, int, int, str]:
                     if write_lightcurve_csv(output_dir, sourceid, lc_data):
                         n_valid += 1
         
+        # CRITICAL: If we had valid candidates but saved nothing, that's a FAILURE
+        if len(valid_indices) > 0 and n_valid == 0:
+            error_msg = f"SILENT_FAIL: {len(valid_indices)} candidates but 0 saved"
+            return (tile_id, n_sources, n_valid, error_msg)
+
         return (tile_id, n_sources, n_valid, "")
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"

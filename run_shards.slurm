@@ -4,11 +4,11 @@
 #SBATCH --error=virac_shard_%A_%a.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=96    # Updated to match core96 architecture 
-#SBATCH --mem=2G            # Kept high memory for safety (Node has 256GB )
+#SBATCH --cpus-per-task=16    # Updated to match core96 architecture 
+#SBATCH --mem=0            # Kept high memory for safety (Node has 256GB )
 #SBATCH --time=7-00:00:00     # Updated to match the 7-day walltime of the main job 
 #SBATCH --partition=core96    # Added to target the correct queue 
-#SBATCH --array=0-9           # <-- CHANGE THIS: shards 1,2,3 (keep 0 for your running job)
+#SBATCH --array=0-19           # <-- CHANGE THIS: shards 1,2,3 (keep 0 for your running job)
 
 # ==============================================================================
 # VIRAC Sharded Extraction (Core96 Version)
@@ -37,8 +37,8 @@ cd $SLURM_SUBMIT_DIR
 
 # Total shards = your running job + these new ones
 # If running job is shard 0 and you launch array=1-3, total = 4
-TOTAL_SHARDS=4
-WORKERS="$SLURM_CPUS_PER_TASK" # Dynamically set workers to 96 [cite: 14]
+TOTAL_SHARDS=20
+WORKERS=16 #"$SLURM_CPUS_PER_TASK" # Dynamically set workers to 96 [cite: 14]
 
 echo "=============================================="
 echo "Shard $SLURM_ARRAY_TASK_ID of $TOTAL_SHARDS"
