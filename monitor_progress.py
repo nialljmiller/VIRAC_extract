@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-VIRAC Extraction Cockpit (Robust Squeue Edition)
-================================================
-- Robust squeue parsing (Handling [0-9] ranges)
-- Accurate Resource Stats (Memory/CPU)
-- Real-time File Activity
+VIRAC Extraction Cockpit (Bulletproof Edition)
+==============================================
+- Guaranteed Resource Stats (sstat -a)
+- Startup Hang Detection
+- Lockfile & Stale Data Warnings
 """
 
 import os
@@ -22,7 +22,6 @@ import time
 
 DEFAULT_OUTPUT_DIR = "/beegfs/car/njm/virac_lightcurves/"
 PRIMVS_FILENAME = "PRIMVS_ID.csv"
-# Get user safely, default to njm if not found
 USER = os.environ.get('USER', 'njm')
 
 # =============================================================================
@@ -48,7 +47,6 @@ def get_latest_logs(directory: Path) -> dict:
     return shard_logs
 
 def parse_slurm_range(range_str: str) -> list:
-    """Expands Slurm ranges like '6-19' or '1,3,5-7' into a list of integers."""
     ids = []
     try:
         parts = range_str.split(',')
@@ -62,86 +60,55 @@ def parse_slurm_range(range_str: str) -> list:
     return ids
 
 def get_active_jobs_info():
-    """
-    Get mapping of Shard ID -> Slurm Job Info by parsing Job ID strings.
-    Handles '233251_0' (Active) and '233251_[6-19]' (Pending).
-    """
+    """Get Shard ID -> Job Info from squeue."""
     mapping = {}
     try:
-        # Get JobID, State, Time, Reason
         cmd = ['squeue', '-u', USER, '-h', '-o', '%i %t %M %r']
         res = subprocess.run(cmd, capture_output=True, text=True)
-        
-        # Regex to parse '12345_1' or '12345_[1-5]'
-        # Capture groups: 1=BaseID, 2=IndexOrRange
         id_pattern = re.compile(r"(\d+)_(\[.*?\]|\d+)")
 
         for line in res.stdout.splitlines():
             parts = line.split()
             if len(parts) < 3: continue
             
-            job_str = parts[0]
-            state = parts[1]
-            time_str = parts[2]
-            
+            job_str, state, time_str = parts[0], parts[1], parts[2]
             match = id_pattern.search(job_str)
+            
             if match:
-                base_id = match.group(1)
-                suffix = match.group(2)
-                
-                # Check for brackets [6-19]
+                base_id, suffix = match.group(1), match.group(2)
                 if '[' in suffix:
-                    # Remove brackets and parse range
                     inner = suffix.replace('[', '').replace(']', '')
-                    indices = parse_slurm_range(inner)
-                    for idx in indices:
-                        mapping[idx] = {
-                            'job_id': f"{base_id}_{idx}", # Synthesize full ID
-                            'state': state,
-                            'time': time_str,
-                            'is_range': True
-                        }
+                    for idx in parse_slurm_range(inner):
+                        mapping[idx] = {'job_id': f"{base_id}_{idx}", 'state': state, 'time': time_str, 'is_range': True}
                 else:
-                    # Single ID
                     idx = int(suffix)
-                    mapping[idx] = {
-                        'job_id': job_str,
-                        'state': state,
-                        'time': time_str,
-                        'is_range': False
-                    }
-    except Exception as e: 
-        # Fail silently but could print e for debug
-        pass
+                    mapping[idx] = {'job_id': job_str, 'state': state, 'time': time_str, 'is_range': False}
+    except: pass
     return mapping
 
 def get_slurm_resources(active_shard_map):
-    """
-    Query 'sstat' for running jobs to get usage.
-    """
+    """Query sstat with --allsteps to ensure we catch the batch process."""
     stats = {}
-    # Only query running jobs (R) that are single IDs (not ranges)
-    job_ids = [info['job_id'] for info in active_shard_map.values() 
-               if info['state'] == 'R' and not info.get('is_range')]
-    
+    job_ids = [info['job_id'] for info in active_shard_map.values() if info['state'] == 'R' and not info.get('is_range')]
     if not job_ids: return stats
     
-    # Batch query sstat
     job_str = ",".join(job_ids)
     try:
-        cmd = ['sstat', '-j', job_str, '--format=JobID,MaxRSS,AveCPU', '-n', '-P']
+        # Added -a (allsteps) to catch the batch step
+        cmd = ['sstat', '-a', '-j', job_str, '--format=JobID,MaxRSS,AveCPU', '-n', '-P']
         res = subprocess.run(cmd, capture_output=True, text=True)
         
         for line in res.stdout.splitlines():
-            # Output: 233251_0.batch|429496K|95.2%
+            # 233251_0.batch|429496K|95.2%
             parts = line.strip().split('|')
             if len(parts) >= 3:
                 full_id = parts[0]
-                base_id = full_id.split('.')[0] # 233251_0
-                
-                # We want the main batch step stats
-                if 'batch' in full_id or full_id == base_id:
+                base_id = full_id.split('.')[0]
+                # Prioritize the 'batch' step which has the real stats
+                if 'batch' in full_id:
                     stats[base_id] = {'rss': parts[1], 'cpu': parts[2]}
+                elif base_id not in stats:
+                     stats[base_id] = {'rss': parts[1], 'cpu': parts[2]}
     except: pass
     return stats
 
@@ -193,10 +160,6 @@ def inspect_file_health(filepath: Path) -> dict:
     result = {"valid": False, "head": [], "error": None, "size": 0, "name": filepath.name}
     try:
         result["size"] = filepath.stat().st_size
-        result["mtime"] = datetime.fromtimestamp(filepath.stat().st_mtime).strftime('%H:%M:%S')
-        if result["size"] == 0:
-            result["error"] = "Empty file (0B)"
-            return result
         with open(filepath, 'r') as f:
             lines = [f.readline() for _ in range(3)]
             result["head"] = [L.strip() for L in lines if L]
@@ -206,37 +169,13 @@ def inspect_file_health(filepath: Path) -> dict:
     except Exception as e: result["error"] = str(e)
     return result
 
-def get_primvs_coverage(output_dir: Path) -> dict:
-    script_dir = Path(__file__).parent.resolve()
-    primvs_path = script_dir / PRIMVS_FILENAME
-    result = {"found": False, "pct": 0.0, "note": ""}
-    if not primvs_path.exists(): return result
-    result["found"] = True
-    try:
-        with open(primvs_path, 'r') as f:
-            header_line = f.readline().strip().lower()
-            f.seek(0)
-            if "sourceid" in header_line:
-                reader = csv.DictReader(f)
-                id_col = next((h for h in reader.fieldnames if "sourceid" in h.lower()), None)
-                if id_col: ids = [row[id_col].strip() for row in reader if row[id_col]]
-                else: 
-                    f.seek(0); next(f)
-                    ids = [line.split(',')[0].strip() for line in f if line.strip()]
-            else:
-                ids = [line.split(',')[0].strip() for line in f if line.strip()]
-        
-        if len(ids) > 5000:
-            check_ids = random.sample(ids, 2000)
-            result["note"] = "(Sampled 2k)"
-        else:
-            check_ids = ids
-            result["note"] = "(Exact)"
-            
-        hits = sum(1 for sid in check_ids if (output_dir / f"{sid}.csv").exists())
-        if len(check_ids) > 0: result["pct"] = (hits / len(check_ids)) * 100
-    except Exception as e: result["note"] = f"(Error: {str(e)})"
-    return result
+def check_lock_file(output_dir: Path):
+    """Check if the JSON checkpoint is locked."""
+    lock = output_dir / "checkpoints/completed_tiles.json.lock"
+    if lock.exists():
+        age = (datetime.now() - datetime.fromtimestamp(lock.stat().st_mtime)).total_seconds()
+        return True, age
+    return False, 0
 
 # =============================================================================
 # Main Display
@@ -256,100 +195,73 @@ def display_progress(output_dir: str, clear: bool = True):
     total = 22585
     pct = (completed / total * 100)
     files_written = sum(x.get('n_valid', 0) for x in stats.values())
-    sources_scanned = sum(x.get('n_sources', 0) for x in stats.values())
     
     print(f" PROGRESS: {pct:5.1f}%  [{completed:,} / {total:,} Tiles]")
-    print(f" DATA:     {files_written:,} light curves saved ({sources_scanned:,} scanned)")
+    print(f" DATA:     {files_written:,} light curves saved")
+    
+    # Check Lock
+    is_locked, lock_age = check_lock_file(output_dir)
+    if is_locked:
+        print(f" WARNING:  Lockfile found! (Age: {int(lock_age)}s). If >300s, jobs may be hung.")
     print("-" * 95)
 
     # 2. Live Resource Table
     logs = get_latest_logs(Path("."))
-    active_shards = get_active_jobs_info() # Squeue data (Truth)
-    resources = get_slurm_resources(active_shards) # Sstat data
+    active_shards = get_active_jobs_info()
+    resources = get_slurm_resources(active_shards)
 
     print(f" {'ID':<3} | {'STATUS':<9} | {'MEM (RSS)':<10} | {'CPU (Avg)':<10} | {'BATCH':<9} | {'TILE ID':<14} | {'PROGRESS':<12} | {'UPDATED'}")
     print("-" * 95)
 
-    total_rss = 0.0
-    
-    # Merge log IDs and Queue IDs to show everything
     all_ids = sorted(list(set(list(logs.keys()) + list(active_shards.keys()))))
     
     for shard_idx in all_ids:
-        # Get Log Info
         log_info = parse_shard_status(logs[shard_idx][1]) if shard_idx in logs else {}
-        
-        # Get Queue Info (The Truth)
         q_info = active_shards.get(shard_idx, {})
-        job_id = q_info.get('job_id')
-        slurm_state = q_info.get('state', 'MISSING')
         
-        # Determine Display State
-        display_state = slurm_state
-        if slurm_state == 'R': display_state = "ACTIVE"
-        elif slurm_state == 'PD': display_state = "PENDING"
-        elif slurm_state == 'MISSING': 
+        display_state = q_info.get('state', 'MISSING')
+        if display_state == 'R': display_state = "ACTIVE"
+        elif display_state == 'PD': display_state = "PENDING"
+        elif display_state == 'MISSING': 
              if log_info.get('age_seconds', 9999) < 600: display_state = "FINISHING"
              else: display_state = "DEAD"
 
-        # If Pending, log info is invalid
         if display_state == "PENDING":
             log_info = {"batch": "-", "tile": "(Queued)", "progress": "-", "updated": "-"}
             
-        # Get Resources
-        usage = {'rss': '-', 'cpu': '-'}
-        if job_id in resources:
-            usage = resources[job_id]
+        # Resources
+        usage = resources.get(q_info.get('job_id'), {'rss': '-', 'cpu': '-'})
 
-        # Sum Memory
-        try:
-            val = float(re.sub(r'[a-zA-Z]', '', usage['rss']))
-            if 'K' in usage['rss']: total_rss += val/1024/1024
-            elif 'M' in usage['rss']: total_rss += val/1024
-            elif 'G' in usage['rss']: total_rss += val
-        except: pass
+        # Startup Hang Detection
+        if display_state == "ACTIVE" and "Starting" in log_info.get('tile', ''):
+             if log_info.get('age_seconds', 0) > 300:
+                 display_state = "HUNG?"
 
         print(f" {shard_idx:<3} | {display_state:<9} | {usage['rss']:<10} | {usage['cpu']:<10} | {log_info.get('batch','-'):<9} | {log_info.get('tile','-'):<14} | {log_info.get('progress','-'):<12} | {log_info.get('updated','-')}")
 
     print("-" * 95)
-    print(f" CLUSTER LOAD: {len(resources)} active jobs reporting stats | Total RAM: {total_rss:.2f} GB")
-    print("=" * 95)
 
-    # 3. File Activity & QC
+    # 3. File Activity
     recents = get_recent_files(output_dir)
-    print(f" RECENT ACTIVITY (Last {len(recents)} files found in scan):")
     if recents:
-        for t, path, name, size in recents:
-            ts = datetime.fromtimestamp(t).strftime('%H:%M:%S')
-            print(f"   [{ts}] {name} ({size} bytes)")
+        last_file_age = (datetime.now().timestamp() - recents[0][0])
+        age_str = str(timedelta(seconds=int(last_file_age)))
+        print(f" RECENT ACTIVITY: Last file written {age_str} ago.")
         
-        # QC newest
+        if last_file_age > 3600:
+            print(f" !!! WARNING !!! No new data produced in over 1 hour.")
+
         latest_file = Path(recents[0][1])
         qc = inspect_file_health(latest_file)
         print("-" * 95)
-        print(f" INTEGRITY CHECK: {qc['name']}")
+        print(f" LATEST FILE: {qc['name']}")
         print(f"   Status: {('PASS' if qc['valid'] else 'FAIL')} [{qc.get('error','')}]")
         if qc['head']:
-            print(f"   Header: {qc['head'][0][:80]}...")
-            if len(qc['head']) > 1:
-                print(f"   Row 1:  {qc['head'][1][:80]}...")
+            print(f"   Row 1:  {qc['head'][1][:80]}...")
     else:
-        print("   No files found yet.")
+        print(" RECENT ACTIVITY: No files found yet.")
 
     print("=" * 95)
-    
-    # Coverage
-    primvs = get_primvs_coverage(output_dir)
-    if primvs["found"]:
-         print(f" TARGETS:  {primvs['pct']:5.2f}% coverage in output {primvs['note']}")
-
-def watch_progress(output_dir: str, interval: int = 10):
-    try:
-        while True:
-            display_progress(output_dir)
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        print("\nExiting.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -357,5 +269,8 @@ if __name__ == "__main__":
     parser.add_argument("--watch", "-w", action="store_true")
     parser.add_argument("--interval", "-i", type=int, default=10)
     args = parser.parse_args()
-    if args.watch: watch_progress(args.output_dir, args.interval)
+    if args.watch: 
+        try:
+             while True: display_progress(args.output_dir); time.sleep(args.interval)
+        except: pass
     else: display_progress(args.output_dir, clear=False)
