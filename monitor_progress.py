@@ -38,49 +38,28 @@ def load_json_safe(filepath: Path) -> dict:
         return {}
 
 def get_latest_logs(directory: Path) -> dict:
-    """Finds the most recent .err log file for each shard index."""
     shard_logs = {}
     pattern = re.compile(r"virac_shard_(\d+)_(\d+)\.err")
-    
-    log_files = glob.glob("virac_shard_*_*.err")
-    
-    for log_file in log_files:
+    for log_file in glob.glob("virac_shard_*_*.err"):
         match = pattern.search(log_file)
         if match:
-            job_id = int(match.group(1))
-            shard_idx = int(match.group(2))
-            
-            # Keep only the newest job_id for this shard index
-            if shard_idx not in shard_logs:
+            job_id, shard_idx = int(match.group(1)), int(match.group(2))
+            if shard_idx not in shard_logs or job_id > shard_logs[shard_idx][0]:
                 shard_logs[shard_idx] = (job_id, log_file)
-            else:
-                if job_id > shard_logs[shard_idx][0]:
-                    shard_logs[shard_idx] = (job_id, log_file)
-    
     return {k: v[1] for k, v in shard_logs.items()}
 
 def parse_shard_status(log_file: str) -> dict:
-    """Reads the tail of a log file to extract current status."""
     status = {"tile": "Starting...", "progress": "-", "batch": "-", "updated": "N/A"}
-    
     try:
         fpath = Path(log_file)
         if not fpath.exists(): return status
-            
         status["updated"] = datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%H:%M:%S')
-        
-        # Read last 64KB (Increased to catch updates in large log files)
         file_size = fpath.stat().st_size
         read_size = min(65536, file_size)
-        
         with open(fpath, 'rb') as f:
-            if file_size > read_size:
-                f.seek(-read_size, 2)
+            if file_size > read_size: f.seek(-read_size, 2)
             lines = f.read().decode('utf-8', errors='ignore').splitlines()
-            
-        # Parse: "INFO - [55/5530] n1024_8954892: 9856/13849"
         prog_pattern = re.compile(r"\[(\d+/\d+)\]\s+(n\d+_\d+):\s+(\d+/\d+)")
-        
         for line in reversed(lines):
             match = prog_pattern.search(line)
             if match:
@@ -201,6 +180,20 @@ def inspect_file_health(filepath: Path) -> dict:
 # Main Dashboard
 # =============================================================================
 
+def get_queue_status():
+    """Get pending jobs from squeue."""
+    pending = []
+    try:
+        res = subprocess.run(['squeue', '-u', os.environ.get('USER', 'njm'), '-h', '-o', '%i %n %t %r'], 
+                             capture_output=True, text=True)
+        for line in res.stdout.splitlines():
+            if 'PD' in line:
+                parts = line.split()
+                pending.append(f"{parts[1]} ({parts[3]})")
+    except: pass
+    return pending
+
+
 def display_progress(output_dir: str, clear: bool = True):
     output_dir = Path(output_dir)
     checkpoint_dir = output_dir / "checkpoints"
@@ -232,20 +225,32 @@ def display_progress(output_dir: str, clear: bool = True):
     print(f" {'ID':<4} | {'STATUS':<10} | {'BATCH':<10} | {'TILE ID':<15} | {'PROGRESS':<14} | {'UPDATED'}")
     print("-" * 80)
     
+    # Shard Table
+    print(f" {'ID':<4} | {'STATUS':<10} | {'BATCH':<10} | {'TILE ID':<15} | {'PROGRESS':<14} | {'UPDATED'}")
+    print("-" * 80)
     logs = get_latest_logs(Path("."))
-    active_shards = sorted(logs.keys())
-    
-    for shard_idx in active_shards:
-        if shard_idx > 3: continue 
-        
+    for shard_idx in sorted(logs.keys()):
+        # No filter! Show all detected shards.
         info = parse_shard_status(logs[shard_idx])
-        
         state = "ACTIVE"
         if "Starting" in info['tile']: state = "INIT"
         
+        # Check if stale (>30 mins)
+        try:
+            last_up = datetime.strptime(info['updated'], '%H:%M:%S')
+            if (datetime.now() - last_up.replace(year=datetime.now().year, month=datetime.now().month, day=datetime.now().day)).seconds > 1800:
+                state = "STALLED?"
+        except: pass
+
         print(f" {shard_idx:<4} | {state:<10} | {info['batch']:<10} | {info['tile']:<15} | {info['progress']:<14} | {info['updated']}")
 
-    print("-" * 80)
+    # Queue Info
+    pending = get_queue_status()
+    if pending:
+        print("-" * 80)
+        print(f" QUEUED SHARDS: {', '.join(pending[:3])} ... ({len(pending)} total pending)")
+
+    print("=" * 80)
 
     # --- 3. Coverage ---
     primvs = get_primvs_coverage(output_dir)
