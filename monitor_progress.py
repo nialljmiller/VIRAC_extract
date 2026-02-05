@@ -221,10 +221,7 @@ def display_progress(output_dir: str, clear: bool = True):
         print(f" FAILURES:         {len(failed)} tiles (Check logs!)")
     print("-" * 80)
 
-    # --- 2. Live Shard Table ---
-    print(f" {'ID':<4} | {'STATUS':<10} | {'BATCH':<10} | {'TILE ID':<15} | {'PROGRESS':<14} | {'UPDATED'}")
-    print("-" * 80)
-    
+
     # Shard Table
     print(f" {'ID':<4} | {'STATUS':<10} | {'BATCH':<10} | {'TILE ID':<15} | {'PROGRESS':<14} | {'UPDATED'}")
     print("-" * 80)
