@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-VIRAC Extraction Monitor (Ultimate Edition)
-===========================================
-Combines real-time log parsing (Dashboard) with deep data integrity checks (QC).
-Features:
+VIRAC Extraction Monitor (Repaired & Enhanced)
+==============================================
 - Global Progress Stats
-- Live per-shard status table (Tile ID, Progress, Speed)
-- PRIMVS Target List Coverage
-- Deep CSV Integrity Inspection (Header & Row checks)
+- Live per-shard status (Fixed stale updates)
+- PRIMVS Target Coverage (Fixed matching logic)
+- Deep QC on the NEWEST available file
 """
 
 import os
@@ -44,7 +42,6 @@ def get_latest_logs(directory: Path) -> dict:
     shard_logs = {}
     pattern = re.compile(r"virac_shard_(\d+)_(\d+)\.err")
     
-    # Look in current directory for log files
     log_files = glob.glob("virac_shard_*_*.err")
     
     for log_file in log_files:
@@ -72,9 +69,9 @@ def parse_shard_status(log_file: str) -> dict:
             
         status["updated"] = datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%H:%M:%S')
         
-        # Read last 4KB to catch recent updates
+        # Read last 64KB (Increased to catch updates in large log files)
         file_size = fpath.stat().st_size
-        read_size = min(4096, file_size)
+        read_size = min(65536, file_size)
         
         with open(fpath, 'rb') as f:
             if file_size > read_size:
@@ -99,6 +96,7 @@ def parse_shard_status(log_file: str) -> dict:
 # =============================================================================
 
 def get_primvs_coverage(output_dir: Path) -> dict:
+    """Robust PRIMVS ID matching logic."""
     script_dir = Path(__file__).parent.resolve()
     primvs_path = script_dir / PRIMVS_FILENAME
     
@@ -108,17 +106,22 @@ def get_primvs_coverage(output_dir: Path) -> dict:
 
     try:
         with open(primvs_path, 'r') as f:
-            # Check for header
-            sample = f.read(1024); f.seek(0)
-            has_header = csv.Sniffer().has_header(sample)
+            # Simple, robust header check
+            header_line = f.readline().strip().lower()
+            f.seek(0)
             
-            if has_header:
+            if "sourceid" in header_line:
                 reader = csv.DictReader(f)
-                headers = [h.strip().lower() for h in reader.fieldnames]
-                id_col = next((h for h in headers if "sourceid" in h), reader.fieldnames[0])
-                f.seek(0); reader = csv.DictReader(f)
-                ids = [row[id_col].strip() for row in reader if row[id_col]]
+                # Find the exact column name that contains 'sourceid'
+                id_col = next((h for h in reader.fieldnames if "sourceid" in h.lower()), None)
+                if id_col:
+                    ids = [row[id_col].strip() for row in reader if row[id_col]]
+                else:
+                    # Fallback if detection failed
+                    f.seek(0); next(f)
+                    ids = [line.split(',')[0].strip() for line in f if line.strip()]
             else:
+                # No header, assume col 0
                 ids = [line.split(',')[0].strip() for line in f if line.strip()]
                 
         if len(ids) > 5000:
@@ -129,29 +132,53 @@ def get_primvs_coverage(output_dir: Path) -> dict:
             result["note"] = "(Exact)"
             
         result["checked"] = len(check_ids)
-        hits = sum(1 for sid in check_ids if (output_dir / f"{sid}.csv").exists())
+        
+        # Check existence
+        hits = 0
+        for sid in check_ids:
+            if (output_dir / f"{sid}.csv").exists():
+                hits += 1
+                
         result["hits"] = hits
         if result["checked"] > 0:
             result["pct"] = (hits / result["checked"]) * 100
             
-    except: pass
+    except Exception as e:
+        result["note"] = f"(Error: {str(e)})"
+        
     return result
 
-def get_sample_file(directory: Path) -> Path:
-    """Fast scandir to find one random CSV file."""
+def get_newest_sample(directory: Path, scan_limit: int = 2000) -> Path:
+    """
+    Scans a batch of files and returns the one with the NEWEST timestamp.
+    Does NOT scan the entire directory (too slow).
+    """
+    newest_file = None
+    newest_time = 0
+    count = 0
+    
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
                 if entry.name.endswith('.csv'):
-                    return Path(entry.path)
+                    mtime = entry.stat().st_mtime
+                    if mtime > newest_time:
+                        newest_time = mtime
+                        newest_file = Path(entry.path)
+                    
+                    count += 1
+                    if count >= scan_limit:
+                        break
     except: pass
-    return None
+    return newest_file
 
 def inspect_file_health(filepath: Path) -> dict:
     """Deep inspection of CSV integrity."""
     result = {"valid": False, "head": [], "error": None, "size": 0, "name": filepath.name}
     try:
         result["size"] = filepath.stat().st_size
+        result["mtime"] = datetime.fromtimestamp(filepath.stat().st_mtime).strftime('%H:%M:%S')
+        
         if result["size"] == 0:
             result["error"] = "Empty file (0B)"
             return result
@@ -209,7 +236,7 @@ def display_progress(output_dir: str, clear: bool = True):
     active_shards = sorted(logs.keys())
     
     for shard_idx in active_shards:
-        if shard_idx > 3: continue # Hide cancelled shards
+        if shard_idx > 3: continue 
         
         info = parse_shard_status(logs[shard_idx])
         
@@ -227,14 +254,14 @@ def display_progress(output_dir: str, clear: bool = True):
     else:
         print(" TARGETS: PRIMVS_ID.csv not found.")
 
-    # --- 4. Deep QC ---
-    sample_file = get_sample_file(output_dir)
+    # --- 4. Deep QC (Newest File) ---
+    sample_file = get_newest_sample(output_dir, scan_limit=1000)
     if sample_file:
         qc = inspect_file_health(sample_file)
         status = "PASS" if qc['valid'] else f"FAIL [{qc['error']}]"
         
         print("-" * 80)
-        print(f" QC SAMPLE: {qc['name']} | Size: {qc['size']} bytes | Integrity: {status}")
+        print(f" QC SAMPLE: {qc['name']} | Time: {qc['mtime']} | Integrity: {status}")
         if qc['head']:
             print(f"   Header: {qc['head'][0][:70]}...")
             if len(qc['head']) > 1:
