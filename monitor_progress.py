@@ -150,16 +150,25 @@ def check_lock_file(output_dir: Path):
 # =============================================================================
 
 def get_recent_files(directory: Path, scan_limit: int = 3000):
-    """Scan for newest 5 files."""
+    """Scan for newest 5 files in hierarchical directory structure."""
     files_found = []
     try:
         count = 0
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if entry.name.endswith('.csv'):
-                    files_found.append((entry.stat().st_mtime, entry.path, entry.name, entry.stat().st_size))
+        # Walk through hierarchical subdirectories
+        for root, dirs, files in os.walk(directory):
+            # Skip checkpoint and logs directories
+            if 'checkpoints' in root or 'logs' in root:
+                continue
+            for filename in files:
+                if filename.endswith('.csv'):
+                    filepath = os.path.join(root, filename)
+                    stat_info = os.stat(filepath)
+                    files_found.append((stat_info.st_mtime, filepath, filename, stat_info.st_size))
                     count += 1
-                    if count >= scan_limit: break
+                    if count >= scan_limit:
+                        break
+            if count >= scan_limit:
+                break
     except: pass
     files_found.sort(key=lambda x: x[0], reverse=True)
     return files_found[:5]
@@ -176,6 +185,13 @@ def inspect_file_health(filepath: Path) -> dict:
         else: result["valid"] = True
     except Exception as e: result["error"] = str(e)
     return result
+
+def get_hierarchical_path(source_id, base_dir):
+    """Get hierarchical path for a source ID"""
+    source_str = str(source_id)
+    subdir1 = source_str[:3]
+    subdir2 = source_str[3:6]
+    return base_dir / subdir1 / subdir2 / f"{source_id}.csv"
 
 def get_primvs_coverage(output_dir: Path) -> dict:
     script_dir = Path(__file__).parent.resolve()
@@ -204,7 +220,7 @@ def get_primvs_coverage(output_dir: Path) -> dict:
             check_ids = ids
             result["note"] = "(Exact)"
             
-        hits = sum(1 for sid in check_ids if (output_dir / f"{sid}.csv").exists())
+        hits = sum(1 for sid in check_ids if get_hierarchical_path(sid, output_dir).exists())
         if len(check_ids) > 0: result["pct"] = (hits / len(check_ids)) * 100
     except Exception as e: result["note"] = f"(Error: {str(e)})"
     return result

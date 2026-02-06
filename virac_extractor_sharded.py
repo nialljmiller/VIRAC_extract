@@ -251,7 +251,7 @@ def get_output_path(source_id, output_dir):
 
 def write_lightcurve_csv(output_dir: Path, sourceid: int, data: np.ndarray) -> bool:
     try:
-        filepath = get_output_path(source_id, output_dir)
+        filepath = get_output_path(sourceid, output_dir)
         with open(filepath, 'w') as f:
             f.write(CSV_HEADER)
             for row in data:
@@ -299,7 +299,7 @@ def process_tile(args: Tuple[str, str, str, int]) -> Tuple[str, int, int, str]:
             
             for idx in valid_indices:
                 sourceid = sourceids[idx]
-                csv_path = output_dir / f"{sourceid}.csv"
+                csv_path = Path(get_output_path(sourceid, output_dir))
                 if csv_path.exists():
                     n_valid += 1
                     continue

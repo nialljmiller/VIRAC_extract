@@ -4,8 +4,8 @@
 #SBATCH --error=virac_shard_%A_%a.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16    # Updated to match core96 architecture 
-#SBATCH --mem=0            # Kept high memory for safety (Node has 256GB )
+#SBATCH --cpus-per-task=8     # Reduced to 8 to protect filesystem from metadata overload
+#SBATCH --mem=0               # Use all available node memory
 #SBATCH --time=7-00:00:00     # Updated to match the 7-day walltime of the main job 
 #SBATCH --partition=core96    # Added to target the correct queue 
 #SBATCH --array=0-19           # <-- CHANGE THIS: shards 1,2,3 (keep 0 for your running job)
@@ -35,10 +35,10 @@ export OMP_NUM_THREADS=1
 
 cd $SLURM_SUBMIT_DIR
 
-# Total shards = your running job + these new ones
-# If running job is shard 0 and you launch array=1-3, total = 4
+# Total shards = 20 nodes × 8 workers = 160 concurrent workers
+# Reduced from 16 to 8 workers per node to avoid filesystem metadata overload
 TOTAL_SHARDS=20
-WORKERS=16 #"$SLURM_CPUS_PER_TASK" # Dynamically set workers to 96 [cite: 14]
+WORKERS=8
 
 echo "=============================================="
 echo "Shard $SLURM_ARRAY_TASK_ID of $TOTAL_SHARDS"
