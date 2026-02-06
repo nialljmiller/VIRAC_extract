@@ -231,9 +231,27 @@ def count_ks_detections(lc: h5py.File, idx: int, cat_filter: np.ndarray) -> int:
         return 0
 
 
+
+def get_output_path(source_id, output_dir):
+    """Create hierarchical path to avoid directory explosion"""
+    # Use first 2-3 digits of source_id as subdirs
+    # Example: source_id = 8365035120893
+    # -> output_dir/836/503/8365035120893.csv
+    
+    source_str = str(source_id)
+    subdir1 = source_str[:3]  # First 3 digits
+    subdir2 = source_str[3:6] # Next 3 digits
+    
+    subdir_path = os.path.join(output_dir, subdir1, subdir2)
+    os.makedirs(subdir_path, exist_ok=True)
+    
+    return os.path.join(subdir_path, f"{source_id}.csv")
+
+
+
 def write_lightcurve_csv(output_dir: Path, sourceid: int, data: np.ndarray) -> bool:
     try:
-        filepath = output_dir / f"{sourceid}.csv"
+        filepath = get_output_path(source_id, output_dir)
         with open(filepath, 'w') as f:
             f.write(CSV_HEADER)
             for row in data:
