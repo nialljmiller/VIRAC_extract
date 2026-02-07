@@ -7,7 +7,7 @@ VIRAC Extraction Cockpit (Complete Edition)
 - Target Coverage (PRIMVS)
 - Deep QC (Header + Row Preview)
 - Lockfile Detection
-- Accurate File Count & Size Estimation
+- Size Estimation from Ledger Data
 """
 
 import os
@@ -147,44 +147,50 @@ def check_lock_file(output_dir: Path):
     return False, 0
 
 # =============================================================================
-# File Counting & Size Estimation
+# File Size Estimation
 # =============================================================================
 
-def count_and_sample_files(directory: Path, sample_size: int = 1000):
+def sample_file_sizes(directory: Path, sample_size: int = 1000):
     """
-    Efficiently count all CSV files and sample sizes from hierarchical structure.
-    Returns: (total_count, avg_size_bytes, sampled_sizes_list)
+    Quickly sample file sizes using find + head (fast, doesn't traverse everything).
+    Returns average size in bytes.
     """
-    total_count = 0
-    sampled_sizes = []
-    sample_interval = 1  # Will be adjusted after counting starts
-    
     try:
+        cmd = f"find {directory} -type f -name '*.csv' | head -{sample_size} | xargs stat -c%s"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            sizes = [int(s) for s in result.stdout.strip().split('\n') if s]
+            if sizes:
+                return sum(sizes) / len(sizes)
+    except:
+        pass
+    
+    # Fallback: manual sampling if command fails
+    try:
+        count = 0
+        total_size = 0
         for root, dirs, files in os.walk(directory):
-            # Skip checkpoint and logs directories
             if 'checkpoints' in root or 'logs' in root:
                 continue
-            
             for filename in files:
                 if filename.endswith('.csv'):
-                    total_count += 1
-                    
-                    # Sample files at intervals to get ~sample_size samples
-                    if len(sampled_sizes) < sample_size:
-                        if total_count % max(1, total_count // sample_size) == 0:
-                            try:
-                                filepath = os.path.join(root, filename)
-                                size = os.path.getsize(filepath)
-                                sampled_sizes.append(size)
-                            except:
-                                pass
-    except Exception as e:
-        print(f"Error counting files: {e}")
+                    try:
+                        filepath = os.path.join(root, filename)
+                        total_size += os.path.getsize(filepath)
+                        count += 1
+                        if count >= sample_size:
+                            return total_size / count
+                    except:
+                        continue
+            if count >= sample_size:
+                break
+        if count > 0:
+            return total_size / count
+    except:
+        pass
     
-    # Calculate average from samples
-    avg_size = sum(sampled_sizes) / len(sampled_sizes) if sampled_sizes else 0
-    
-    return total_count, avg_size, sampled_sizes
+    return 0
 
 # =============================================================================
 # Science & QC
@@ -283,21 +289,19 @@ def display_progress(output_dir: str, clear: bool = True):
     completed = len(stats)
     total = 22585
     pct = (completed / total * 100)
+    files_written = sum(x.get('n_valid', 0) for x in stats.values())
     sources_scanned = sum(x.get('n_sources', 0) for x in stats.values())
     
     print(f" PROGRESS: {pct:5.1f}%  [{completed:,} / {total:,} Tiles]")
+    print(f" DATA:     {files_written:,} light curves saved ({sources_scanned:,} scanned)")
     
-    # Count actual files and estimate sizes
-    print(f" COUNTING FILES & ESTIMATING SIZE...", end='', flush=True)
-    file_count, avg_size, samples = count_and_sample_files(output_dir, sample_size=1000)
-    print(f"\r DATA:     {file_count:,} files extracted ({sources_scanned:,} sources scanned)")
-    
-    # Calculate current and projected sizes
-    current_size_gb = (file_count * avg_size) / (1024**3)
-    projected_total_files = (file_count / pct * 100) if pct > 0 else 0
-    projected_size_tb = (projected_total_files * avg_size) / (1024**4)
-    
-    print(f" SIZE:     Current: {current_size_gb:.2f} GB  |  Avg file: {avg_size/1024:.1f} KB  |  Projected at 100%: {projected_size_tb:.2f} TB")
+    # Sample file sizes and estimate total
+    avg_size = sample_file_sizes(output_dir, sample_size=1000)
+    if avg_size > 0:
+        current_size_gb = (files_written * avg_size) / (1024**3)
+        projected_files = (files_written / pct * 100) if pct > 0 else 0
+        projected_size_tb = (projected_files * avg_size) / (1024**4)
+        print(f" SIZE:     Current: {current_size_gb:.2f} GB  |  Avg: {avg_size/1024:.1f} KB/file  |  Projected @ 100%: {projected_size_tb:.2f} TB")
     
     is_locked, lock_age = check_lock_file(output_dir)
     if is_locked:
