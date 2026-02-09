@@ -36,7 +36,16 @@ cat = PrimvsCatalog(LOCAL_BASE)
 # Read source IDs from FITS
 from astropy.io import fits as afits
 from astropy.table import Table
-tbl = Table.read("reclass.fits", hdu=1)
+import sys
+
+if len(sys.argv) < 2:
+    print("Usage: python combine_lightcurves.py <input_fits> [output_fits]")
+    print("Example: python combine_lightcurves.py reclass.fits reclass_lightcurves.fits")
+    sys.exit(1)
+
+input_fits = sys.argv[1]
+
+tbl = Table.read(input_fits, hdu=1)
 source_ids = tbl["sourceid"].data
 print(f"Found {len(source_ids)} source IDs in reclass.fits\n")
 
